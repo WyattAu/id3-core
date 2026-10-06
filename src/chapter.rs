@@ -46,6 +46,19 @@ pub struct Chapter {
     pub frames: Vec<(crate::FrameId, Vec<u8>)>,
 }
 
+/// Encode a `TIT2` sub-frame for a chapter or TOC heading.
+///
+/// Returns `None` rather than a partially built frame when the id cannot be formed,
+/// because a sub-frame with an invalid id is worse than no sub-frame: it would be written
+/// out and then skipped by every reader.
+fn title_subframe(text: &str) -> Option<(crate::FrameId, Vec<u8>)> {
+    let id = crate::FrameId::new(*b"TIT2").ok()?;
+    let body = crate::text::Text::single(crate::text::TextEncoding::Utf8, text)
+        .to_body()
+        .ok()?;
+    Some((id, body))
+}
+
 impl Chapter {
     /// A chapter with just an id and a start time; the common case.
     #[must_use]
@@ -71,6 +84,67 @@ impl Chapter {
     #[must_use]
     pub fn duration_ms(&self) -> Option<u32> {
         self.end_ms.map(|end| end.saturating_sub(self.start_ms))
+    }
+
+    /// Attach a `TIT2` title to this chapter.
+    ///
+    /// Reading a chapter's title was public but writing one was not: the sub-frame list
+    /// is a pair of an id and a raw body, so a caller wanting to *emit* chapters had to
+    /// hand-encode a text frame to get a title into a file. That is workable but it means
+    /// the encoding choice — and the trailing NUL a real writer emits — is left to
+    /// whoever is holding the bytes, which is how the two ends drift apart.
+    ///
+    /// UTF-8 encoding is used, which is what mutagen, ffmpeg and this crate's own reader
+    /// all produce, and the sub-frame is terminated with a NUL as ID3v2.4 requires.
+    /// Replaces any existing `TIT2`, so calling it twice does not accumulate frames.
+    #[must_use]
+    pub fn with_title(mut self, title: &str) -> Self {
+        self.set_title(title);
+        self
+    }
+
+    /// Set or clear the `TIT2` title on this chapter.
+    ///
+    /// An empty title clears the sub-frame rather than writing an empty one, because a
+    /// `TIT2` with nothing in it is read back as a present-but-blank title, which is not
+    /// the same as no title.
+    pub fn set_title(&mut self, title: &str) {
+        self.remove_subframe(b"TIT2");
+        if title.is_empty() {
+            return;
+        }
+        if let Some(frame) = title_subframe(title) {
+            self.frames.push(frame);
+        }
+    }
+
+    /// This chapter's `TIT2` title, if it has one.
+    ///
+    /// Owned rather than borrowed because decoding a text frame produces a fresh
+    /// `String`, and returning a reference to it would either borrow the frame body —
+    /// which holds the *encoded* bytes, not the decoded text — or leak it.
+    #[must_use]
+    pub fn title(&self) -> Option<String> {
+        let body = self.subframe(b"TIT2")?;
+        let id = crate::FrameId::new(*b"TIT2").ok()?;
+        crate::text::Text::parse(id, body)
+            .ok()
+            .map(|t| String::from(t.text()))
+    }
+
+    /// Drop any sub-frame with this id.
+    pub fn remove_subframe(&mut self, id: &[u8; 4]) {
+        self.frames
+            .retain(|(frame_id, _)| frame_id.as_bytes() != id);
+    }
+
+    /// The first sub-frame with this id.
+    #[must_use]
+    pub fn subframe(&self, id: &[u8; 4]) -> Option<&[u8]> {
+        self.frames
+            .iter()
+            .find(|(frame_id, _)| frame_id.as_bytes() == id)
+            .map(|(_, body)| body.as_slice())
     }
 
     /// Parse a `CHAP` body.
@@ -214,10 +288,21 @@ impl Toc {
                 })
             }
         };
-        // Bit 0 is "top-level"; the spec's flag names are inverted in
-        // practice, so both bits are surfaced verbatim.
-        let top_level = flags & 0x01 != 0;
-        let ordered = flags & 0x02 != 0;
+        // Top-level is bit 1 and ordered is bit 0.
+        //
+        // The spec draws this as `%000000ab`, which reads as "six zero bits, then a,
+        // then b" — a is bit 1 and b is bit 0, counting from the *low* end. Reading it
+        // as a = bit 7 transposes the two flags, and it is tempting because the two
+        // disagree often enough to look plausible: a TOC that is top level and not
+        // ordered comes back as the exact opposite, so a caller looking for the root
+        // finds nothing and every consumer loses the chapter order.
+        //
+        // Established from two implementations that share no code: mutagen's
+        // `CTOCFlags.TOP_LEVEL = 0x2`, `ORDERED = 0x1`, and TagLib's
+        // `d->isTopLevel = data & 2; d->isOrdered = data & 1`. A file mutagen wrote with
+        // `flags=CTOCFlags.TOP_LEVEL` carries `0x02` on the wire.
+        let top_level = flags & 0x02 != 0;
+        let ordered = flags & 0x01 != 0;
 
         let mut cursor = header.get(2..).unwrap_or(&[]);
         let mut entries = Vec::with_capacity(usize::from(count));
@@ -255,11 +340,15 @@ impl Toc {
         out.extend_from_slice(self.element_id.as_bytes());
         out.push(0x00);
         let mut flags = 0x00u8;
+        // The same layout [`Toc::parse`] reads, so a TOC written here is read back
+        // identically by mutagen and TagLib. Getting this wrong writes a frame every
+        // other implementation calls "not top level", which loses the chapter order
+        // rather than merely setting the wrong flag.
         if self.top_level {
-            flags |= 0x01;
+            flags |= 0x02;
         }
         if self.ordered {
-            flags |= 0x02;
+            flags |= 0x01;
         }
         out.push(flags);
         // The count is a single byte in the spec. Saturate rather than panic.
@@ -334,15 +423,9 @@ pub fn resolve<'a>(chapters: &'a [Chapter], root: Option<&'a Toc>) -> Vec<Resolv
                 element_id: c.element_id.clone(),
                 start_ms: c.start_ms,
                 end_ms: c.end_ms,
-                title: c.frames.iter().find_map(|(id, data)| {
-                    if id.as_bytes() == b"TIT2" {
-                        crate::text::Text::parse(*id, data)
-                            .ok()
-                            .map(|t| String::from(t.text()))
-                    } else {
-                        None
-                    }
-                }),
+                // The same decoding as `Chapter::title`, so a title is read identically
+                // whether a caller resolves a TOC or asks a single chapter.
+                title: c.title(),
                 depth,
             }
         })
@@ -515,6 +598,163 @@ mod tests {
         assert!(back.top_level);
         assert!(back.ordered);
         assert_eq!(back.entries, vec![String::from("ch1"), String::from("ch2")]);
+    }
+
+    /// A top-level, **not** ordered TOC exactly as mutagen wrote one.
+    ///
+    /// Captured from `mutagen.id3.CTOC(element_id="toc", flags=CTOCFlags.TOP_LEVEL,
+    /// child_element_ids=["ch0","ch1"])` saved as ID3v2.4. The flags byte on the wire is
+    /// `0x02`, which is the discriminator: mutagen's `CTOCFlags.TOP_LEVEL` is `0x2` and
+    /// its `ORDERED` is `0x1`, and TagLib independently agrees
+    /// (`d->isTopLevel = data & 2; d->isOrdered = data & 1`).
+    const MUTAGEN_TOP_LEVEL_NOT_ORDERED: &[u8] = &[
+        b't', b'o', b'c', 0x00, // element id
+        0x02, // flags: TOP_LEVEL set, ORDERED clear
+        0x02, // entry count
+        b'c', b'h', b'0', 0x00, b'c', b'h', b'1', 0x00,
+    ];
+
+    #[test]
+    fn a_chapter_title_round_trips_through_the_wire() {
+        // The sub-frame must survive the body serialisation, not merely sit in the struct:
+        // `parse` reads sub-frames back out of the bytes, so a title that only existed in
+        // memory would look fine until it was written.
+        let c = Chapter::new("ch1", 0)
+            .with_end(30_000)
+            .with_title("Chapter One");
+        let back = Chapter::parse(&c.to_body()).expect("reparses");
+        assert_eq!(back.title().as_deref(), Some("Chapter One"));
+        assert!(
+            c.subframe(b"TIT2").is_some(),
+            "the sub-frame is really there"
+        );
+    }
+
+    #[test]
+    fn a_chapter_title_handles_the_things_real_chapter_titles_contain() {
+        for title in [
+            "Plain",
+            "Has = equals ; semi # hash",
+            "Has \\ backslash",
+            "Line one\nLine two",
+            " Leading and trailing ",
+            "Unicode: éè 中文 📚",
+            "He said \"hi\"",
+        ] {
+            let c = Chapter::new("ch", 0).with_title(title);
+            let back = Chapter::parse(&c.to_body()).expect("reparses");
+            assert_eq!(back.title().as_deref(), Some(title), "for {title:?}");
+        }
+    }
+
+    #[test]
+    fn setting_a_title_twice_replaces_rather_than_accumulates() {
+        // Two TIT2 sub-frames read back as whichever the reader happens to find first, so
+        // an accumulating setter produces a chapter whose title depends on the reader.
+        let c = Chapter::new("ch", 0)
+            .with_title("First")
+            .with_title("Second");
+        assert_eq!(
+            c.frames
+                .iter()
+                .filter(|(id, _)| id.as_bytes() == b"TIT2")
+                .count(),
+            1,
+            "exactly one TIT2"
+        );
+        let back = Chapter::parse(&c.to_body()).expect("reparses");
+        assert_eq!(back.title().as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn an_empty_title_clears_the_subframe_rather_than_writing_a_blank_one() {
+        // A TIT2 with nothing in it reads back as a present-but-blank title, which is not
+        // the same as having no title at all.
+        let mut c = Chapter::new("ch", 0).with_title("Something");
+        c.set_title("");
+        assert!(
+            c.subframe(b"TIT2").is_none(),
+            "no empty sub-frame is left behind"
+        );
+        assert_eq!(c.title(), None);
+        assert_eq!(
+            Chapter::parse(&c.to_body()).expect("reparses").title(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_chapter_with_no_title_reports_none_rather_than_empty() {
+        assert_eq!(Chapter::new("ch", 0).title(), None);
+    }
+
+    #[test]
+    fn top_level_is_bit_one_and_ordered_is_bit_zero() {
+        // Reading these the other way round reports this TOC as *not* top level, so a
+        // caller hunting for the root finds nothing and the chapters lose their order.
+        let toc = Toc::parse(MUTAGEN_TOP_LEVEL_NOT_ORDERED).expect("parses");
+        assert!(
+            toc.top_level,
+            "0x02 is TOP_LEVEL: mutagen and TagLib both put top-level at bit 1"
+        );
+        assert!(
+            !toc.ordered,
+            "and 0x02 has bit 0 clear, so this TOC is not ordered"
+        );
+    }
+
+    #[test]
+    fn an_ordered_but_not_top_level_toc_is_not_mistaken_for_the_root() {
+        // The mirror image, which is what catches the swap the other way: `0x01` is
+        // ORDERED alone. Reading bit 0 as top-level would hand a caller a non-root TOC
+        // as the root and produce a wrong chapter order.
+        let body = b"toc\x00\x01\x01ch0\x00";
+        let toc = Toc::parse(body).expect("parses");
+        assert!(toc.ordered);
+        assert!(!toc.top_level, "0x01 is not the top-level flag");
+    }
+
+    #[test]
+    fn our_written_flags_are_read_the_same_way_by_mutagen_and_taglib() {
+        // The read side matters, but so does the write side: a CTOC this crate emits
+        // with the flags transposed would be read by mutagen as *not* top level, so
+        // every consumer would fail to find a root and lose the chapter order. Asserted
+        // on the bytes rather than through our own parser, because our parser agreeing
+        // with itself is the bug being fixed.
+        // `Toc::root` is top level *and* ordered, so both flag bits are set: 0x02 for
+        // top-level plus 0x01 for ordered. Asserting the bits separately is what makes
+        // this a real check — asserting `0x03` alone would still pass with them swapped.
+        let mut t = Toc::root("toc");
+        t.push("ch0");
+        let body = t.to_body();
+        let nul = body
+            .iter()
+            .position(|b| *b == 0x00)
+            .expect("has an element id");
+        let flags = body.get(nul + 1).copied().expect("has a flags byte");
+        assert_ne!(
+            flags & 0x02,
+            0,
+            "top level must be bit 1, as mutagen and TagLib read it"
+        );
+        assert_ne!(flags & 0x01, 0, "ordered must be bit 0");
+
+        // And the unambiguous case: top level with ordered clear is 0x02 alone, which is
+        // the byte mutagen wrote and which the two bits cannot both explain.
+        let mut only_top = Toc::root("toc");
+        only_top.ordered = false;
+        only_top.push("ch0");
+        let body = only_top.to_body();
+        let nul = body
+            .iter()
+            .position(|b| *b == 0x00)
+            .expect("has an element id");
+        assert_eq!(body.get(nul + 1), Some(&0x02), "the byte mutagen wrote");
+        assert_eq!(
+            body.get(nul + 2),
+            Some(&0x01),
+            "and the entry count follows"
+        );
     }
 
     #[test]

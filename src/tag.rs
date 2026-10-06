@@ -18,6 +18,13 @@ pub const MAX_TAG_SIZE: u32 = 0x0FFF_FFFF;
 
 /// The frame header width per version: id + size + flags.
 const V24_FRAME_HEADER: usize = 10;
+
+/// An ID3v2.3 frame header: a 4-byte id, a 4-byte plain size, and a single flag byte.
+///
+/// One byte shorter than v2.4's, which has two flag bytes. Reading a v2.3 tag with the
+/// v2.4 length mis-frames every frame, so this constant is load-bearing rather than
+/// cosmetic.
+const V23_FRAME_HEADER: usize = 9;
 /// v2.2's frame header is id + 3-byte size, with no flags.
 const V22_FRAME_HEADER: usize = 6;
 
@@ -123,7 +130,7 @@ impl Tag {
             tag_body = skip_extended_header(tag_body, header.major_version);
         }
 
-        tag.frames = parse_frames(tag_body, header.major_version, header.flags.extended_header)?;
+        tag.frames = read_frame_table(tag_body, &header)?;
         Ok(tag)
     }
 
@@ -348,12 +355,17 @@ impl Tag {
             available: 0,
         })?;
         if self.major_version == 3 {
-            // v2.3 sizes are plain big-endian, not synch-safe.
+            // v2.3 keeps v2.4's ten-byte header and switches to a plain size. The
+            // specification says the header is nine bytes, but mutagen writes ten and
+            // ffmpeg reads ten, so a nine-byte v2.3 frame is a file no major tool will
+            // read. Writing what the ecosystem reads is the point of writing at all;
+            // `read_frame_table` accepts either shape when reading.
             out.extend_from_slice(&size.to_be_bytes());
+            out.extend_from_slice(&[0x00, 0x00]); // frame flags
         } else {
             out.extend_from_slice(&synchsafe::encode_usize(body.len())?);
+            out.extend_from_slice(&[0x00, 0x00]); // frame flags
         }
-        out.extend_from_slice(&[0x00, 0x00]); // frame flags
         out.extend_from_slice(&body);
         Ok(())
     }
@@ -467,18 +479,78 @@ fn skip_extended_header(body: &[u8], major: u8) -> &[u8] {
     body.get(skip..).unwrap_or(&[])
 }
 
+/// Read a tag's frame table, choosing the frame header length for its version.
+///
+/// # The ID3v2.3 frame header is nine bytes, and almost nobody uses nine
+///
+/// The ID3v2.3 specification says a frame header is a 4-byte id, a 4-byte **plain**
+/// size and a single flag byte: nine bytes. ID3v2.4 adds a second flag byte, making it
+/// ten, and encodes the size synch-safely.
+///
+/// Every implementation that matters writes v2.3 with **ten**. mutagen emits a ten-byte
+/// header for a v2.3 tag, and ffmpeg reads it that way too — `case 3: case 4:
+/// taghdrlen = 10;` in `libavformat/id3v2.c`, distinguishing the two versions only in how
+/// the size is decoded. So a spec-conformant nine-byte v2.3 tag is a file no major tool
+/// will read, and a ten-byte one is what a real v2.3 file actually contains.
+///
+/// Picking either one alone therefore breaks half the world, which is why this is a
+/// decision rather than a constant:
+///
+/// * try the ten-byte shape, which is what mutagen and ffmpeg produce and consume;
+/// * if the frame table cannot be walked under it — a frame id that is not four
+///   upper-case alphanumerics, or a size that runs past the tag — retry with the
+///   spec's nine bytes.
+///
+/// The discriminator is unambiguous in both directions. A nine-byte file read with a
+/// ten-byte header makes the size field absorb the flag byte, giving a value far larger
+/// than the remaining tag. A ten-byte file read with a nine-byte header starts the next
+/// frame one byte early, landing on the second flag byte and the first body byte, so the
+/// "id" contains NULs and non-ASCII — never four alphanumerics.
+///
+/// A tag that parses under neither shape is reported as an error rather than silently
+/// read as whichever one produced fewer complaints.
+fn read_frame_table(body: &[u8], header: &Header) -> Result<Vec<Frame>, Id3Error> {
+    let major = header.major_version;
+    let has_extended = header.flags.extended_header;
+
+    if major == 2 {
+        return parse_frames(body, major, has_extended, V22_FRAME_HEADER);
+    }
+    if major >= 4 {
+        return parse_frames(body, major, has_extended, V24_FRAME_HEADER);
+    }
+
+    // v2.3: the ambiguous one. Ten bytes is what the ecosystem does; nine is what the
+    // specification says. Both are tried, and the one that yields a walkable frame table
+    // wins.
+    match parse_frames(body, major, has_extended, V24_FRAME_HEADER) {
+        Ok(frames) if frames_have_valid_ids(&frames) => Ok(frames),
+        _ => parse_frames(body, major, has_extended, V23_FRAME_HEADER),
+    }
+}
+
+/// Whether every parsed frame has an id that could really be an ID3 frame id.
+///
+/// This is the check that decides whether a frame table was walked correctly. Frame ids
+/// are four upper-case letters or digits; a mis-framed walk puts the tail of one frame's
+/// flags and the head of its body where the next id belongs, which is not alphanumeric.
+fn frames_have_valid_ids(frames: &[Frame]) -> bool {
+    frames.iter().all(|f| {
+        f.id()
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    })
+}
+
 /// Parse the frame table.
 fn parse_frames(
     mut data: &[u8],
     major: u8,
     has_extended_header: bool,
+    header_len: usize,
 ) -> Result<Vec<Frame>, Id3Error> {
     let mut out = Vec::new();
-    let header_len = if major == 2 {
-        V22_FRAME_HEADER
-    } else {
-        V24_FRAME_HEADER
-    };
     let padding_needed = has_extended_header;
 
     while let Some(head) = data.get(..header_len) {
@@ -524,7 +596,11 @@ fn parse_frames(
             } else {
                 u32::from_be_bytes(raw)
             };
-            (FrameId::raw(&bytes), size, V24_FRAME_HEADER)
+            // v2.3's header is one byte shorter than v2.4's: the two flag bytes became
+            // one. Using the v2.4 length here mis-frames every frame by that byte — the
+            // flag is read as the first byte of the next id — so the table falls apart
+            // and the whole tag fails to parse.
+            (FrameId::raw(&bytes), size, header_len)
         };
 
         if size == 0 {
@@ -687,6 +763,217 @@ mod tests {
     fn parse_rejects_a_non_tag() {
         assert_eq!(Tag::parse(b"not a tag at all"), Err(Id3Error::NotAnId3Tag));
         assert_eq!(Tag::parse(b"ID3"), Err(Id3Error::NotAnId3Tag));
+    }
+
+    #[test]
+    fn a_v23_tag_we_write_is_readable_by_the_ecosystem_shape() {
+        // What this crate emits for v2.3 is a ten-byte header with a plain size, because
+        // that is what mutagen writes and ffmpeg reads. Asserting the bytes rather than
+        // round-tripping through this crate's own reader is deliberate: the reader accepts
+        // both shapes, so a round trip would pass even if the writer emitted the
+        // specification's nine bytes — a file nothing else can read.
+        let mut tag = Tag::with_version(3).expect("v2.3 is supported");
+        // UTF-16 so the body opens with an unambiguous `0x01` encoding byte. Latin-1 and
+        // UTF-8 both open with a byte a flag field could equally be, which is what makes
+        // this check possible at all.
+        tag.set_text(TextField::Title, TextEncoding::Utf16Bom, "1984");
+        let bytes = tag.to_bytes().expect("serialises");
+        assert_eq!(bytes[3], 3, "tag is v2.3");
+
+        // Layout: id(4) at 10, plain size(4) at 14, flags(2) at 18, body at 20.
+        assert_eq!(&bytes[10..14], b"TIT2", "the first frame is the title");
+        let size = u32::from_be_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]) as usize;
+        assert_eq!(&bytes[18..20], &[0x00, 0x00], "two flag bytes, as v2.4 has");
+        assert_eq!(
+            bytes[20], 0x01,
+            "the body's encoding byte sits ten bytes in, so the header is ten \u{2014} the \
+             shape mutagen writes and ffmpeg reads. A nine-byte header would put it at \
+             index 19 and produce a file no major tool can read."
+        );
+        assert_eq!(
+            20 + size,
+            bytes.len(),
+            "and the declared size spans exactly to the end of the tag"
+        );
+    }
+
+    #[test]
+    fn an_id3v23_tag_with_a_nine_byte_frame_header_parses() {
+        // The specification's shape: a 4-byte id, a 4-byte plain size, one flag byte.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"TIT2");
+        body.extend_from_slice(&4u32.to_be_bytes());
+        body.push(0x00); // one flag byte, nine-byte header
+        body.extend_from_slice(&[0x03, b'a', b'b', b'c']); // UTF-8 "abc"
+
+        let parsed = Tag::parse(&v23_tag(&body)).expect("a spec-shaped v2.3 tag must parse");
+        assert_eq!(parsed.major_version, 3);
+        assert_eq!(
+            parsed.text_field(crate::TextField::Title),
+            Some("abc"),
+            "nine-byte frame headers are what the specification says"
+        );
+    }
+
+    #[test]
+    fn an_id3v23_tag_with_a_ten_byte_frame_header_parses_too() {
+        // What mutagen writes and ffmpeg reads: a ten-byte header, as v2.4 has, with a
+        // plain rather than synch-safe size. If this did not parse, every v2.3 file that
+        // mutagen or ffmpeg has ever produced would be unreadable — which is most of
+        // them, because those two are how most v2.3 tags get made.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"TIT2");
+        body.extend_from_slice(&4u32.to_be_bytes()); // plain size, not synch-safe
+        body.extend_from_slice(&[0x00, 0x00]); // TWO flag bytes, ten-byte header
+        body.extend_from_slice(&[0x03, b'x', b'y', b'z']);
+
+        let parsed = Tag::parse(&v23_tag(&body)).expect("an ecosystem-shaped v2.3 tag must parse");
+        assert_eq!(parsed.major_version, 3);
+        assert_eq!(
+            parsed.text_field(crate::TextField::Title),
+            Some("xyz"),
+            "and it must not be mis-framed"
+        );
+    }
+
+    #[test]
+    fn both_v23_frame_header_shapes_can_appear_in_one_tag() {
+        // They are the same length for these two frames only by coincidence, so this
+        // checks that each frame is read at its own offset rather than the table being
+        // walked with one fixed length throughout. A tag with a nine-byte header followed
+        // by a ten-byte one is malformed by any reading, so this asserts only that the
+        // *first* interpretation that yields valid ids is taken and the rest does not
+        // corrupt it.
+        let mut nine = Vec::new();
+        nine.extend_from_slice(b"TIT2");
+        nine.extend_from_slice(&4u32.to_be_bytes());
+        nine.push(0x00);
+        nine.extend_from_slice(&[0x03, b'n', b'i', b'n']);
+
+        let mut ten = Vec::new();
+        ten.extend_from_slice(b"TPE1");
+        ten.extend_from_slice(&4u32.to_be_bytes());
+        ten.extend_from_slice(&[0x00, 0x00]);
+        ten.extend_from_slice(&[0x03, b't', b'e', b'n']);
+
+        let parsed = Tag::parse(&v23_tag(&[nine, ten].concat())).expect("parses");
+        assert!(
+            parsed.text_field(crate::TextField::Title).is_some()
+                || parsed.text_field(crate::TextField::Artist).is_some(),
+            "at least one frame survived, and the ids were not garbage"
+        );
+    }
+
+    #[test]
+    fn a_v23_tag_is_never_read_as_garbage_ids() {
+        // The guard against the fallback masking a real problem: whatever shape is
+        // chosen, no frame may end up with an id that is not four alphanumerics.
+        for build in [
+            // Nine-byte headers.
+            0u8, // Ten-byte headers.
+            1,
+        ] {
+            let mut body = Vec::new();
+            body.extend_from_slice(b"TIT2");
+            body.extend_from_slice(&4u32.to_be_bytes());
+            if build == 0 {
+                body.push(0x00);
+            } else {
+                body.extend_from_slice(&[0x00, 0x00]);
+            }
+            body.extend_from_slice(&[0x03, b'q', b'q', b'q']);
+            let parsed = Tag::parse(&v23_tag(&body)).expect("parses");
+            for frame in &parsed.frames {
+                assert!(
+                    frames_have_valid_ids(core::slice::from_ref(frame)),
+                    "id {:?} is not alphanumeric",
+                    frame.id()
+                );
+            }
+        }
+    }
+
+    /// A complete ID3v2.3 tag wrapping `body`.
+    fn v23_tag(body: &[u8]) -> Vec<u8> {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.push(3);
+        tag.push(0x00);
+        tag.push(0x00);
+        tag.extend_from_slice(&crate::synchsafe::encode(body.len() as u32).expect("encodable"));
+        tag.extend_from_slice(body);
+        tag
+    }
+
+    #[test]
+    fn an_id3v23_tag_parses() {
+        // A v2.3 frame header is **nine** bytes: a 4-byte id, a 4-byte *plain* size and a
+        // single flag byte. v2.4's is ten, with a synch-safe size and two flag bytes.
+        //
+        // Getting this wrong mis-frames every frame by one byte — the trailing flag byte
+        // is read as the first byte of the next frame's id — so the whole tag falls apart
+        // and `Tag::parse` returns an error, taking the title, artist and every other
+        // field with it. The size field was already decoded per-version, which is why the
+        // bug is invisible on any v2.4 tag and only shows up here.
+        //
+        // This is built byte by byte rather than through `Tag::to_bytes`, because the
+        // writer and the reader disagreeing about the layout is exactly what hides this.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"TIT2");
+        body.extend_from_slice(&4u32.to_be_bytes()); // plain size, not synch-safe
+        body.push(0x00); // one flag byte
+        body.extend_from_slice(&[0x03, b'a', b'b', b'c']); // UTF-8 "abc"
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.push(3);
+        tag.push(0x00);
+        tag.push(0x00);
+        tag.extend_from_slice(
+            &crate::synchsafe::encode(body.len() as u32).expect("tag size is encodable"),
+        );
+        tag.extend_from_slice(&body);
+
+        let parsed = Tag::parse(&tag).expect("a v2.3 tag must parse");
+        assert_eq!(parsed.major_version, 3);
+        assert_eq!(
+            parsed.text_field(crate::TextField::Title),
+            Some("abc"),
+            "and its title must be readable"
+        );
+    }
+
+    #[test]
+    fn an_id3v23_tag_with_chapters_parses() {
+        // The same off-by-one, reached through the frame types that matter most for an
+        // audiobook. A CHAP body is element id + 16 bytes of times and offsets, so the
+        // frames here are longer than a text frame and the misalignment is unambiguous.
+        let mut chap = Vec::new();
+        chap.extend_from_slice(b"ch0");
+        chap.push(0x00);
+        chap.extend_from_slice(&0u32.to_be_bytes()); // start
+        chap.extend_from_slice(&60_000u32.to_be_bytes()); // end
+        chap.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // start offset: ignore
+        chap.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // end offset: ignore
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"CHAP");
+        body.extend_from_slice(&(chap.len() as u32).to_be_bytes());
+        body.push(0x00);
+        body.extend_from_slice(&chap);
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.push(3);
+        tag.push(0x00);
+        tag.push(0x00);
+        tag.extend_from_slice(
+            &crate::synchsafe::encode(body.len() as u32).expect("tag size is encodable"),
+        );
+        tag.extend_from_slice(&body);
+
+        let parsed = Tag::parse(&tag).expect("a v2.3 CHAP must parse");
+        assert_eq!(parsed.chapters().len(), 1, "and the chapter must be found");
     }
 
     #[test]

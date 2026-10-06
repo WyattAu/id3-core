@@ -3,6 +3,72 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.2.0] - 2026-10-06
+
+MP3 is the dominant audiobook format, and `CHAP`/`CTOC` had never been checked against a
+real file. Doing that turned up three defects, two of which made a whole class of tags
+unreadable.
+
+### Fixed
+
+- **`CTOC` top-level and ordered flags were transposed.** Top-level is bit 1 and ordered
+  is bit 0; this crate read bit 0 as top-level and bit 1 as ordered. A TOC that is top
+  level and not ordered came back as the exact opposite, so a caller hunting for the root
+  found none and the chapters lost their order \u{2014} while every existing test passed,
+  because the only CTOCs in the corpus were ones this crate wrote.
+
+  Established from two implementations sharing no code: mutagen's
+  `CTOCFlags.TOP_LEVEL = 0x2`, `ORDERED = 0x1`, and TagLib's
+  `d->isTopLevel = data & 2; d->isOrdered = data & 1`. A file mutagen wrote with
+  `flags=CTOCFlags.TOP_LEVEL` carries `0x02` on the wire, and that byte is the fixture.
+
+  The specification's `%000000ab` diagram reads as "six zero bits, then a, then b" \u{2014} a
+  is bit 1 counting from the low end. Reading it as a = bit 7 is what produced the bug.
+
+- **An ID3v2.3 tag could not be parsed at all.** Every frame was read with v2.4's
+  ten-byte header instead of v2.3's nine, so each frame's trailing flag byte was taken as
+  the first byte of the next frame's id. `Tag::parse` returned an error, which means
+  `MediaProbe` silently lost the title, the artist and every other field of every v2.3
+  file \u{2014} not just the chapters.
+
+  **The nine-byte header is what the specification says, and nothing uses it.** mutagen
+  emits ten for a v2.3 tag and ffmpeg reads ten (`case 3: case 4: taghdrlen = 10;` in
+  `libavformat/id3v2.c`, distinguishing the versions only in how the size is decoded). So
+  a conformant nine-byte tag is a file no major tool can read, while a ten-byte one is
+  what a real v2.3 file contains. Picking either alone breaks half the world, so both are
+  now accepted: the ten-byte shape is tried first and the frame ids are checked for being
+  four alphanumerics, falling back to nine when that fails. The check is unambiguous in
+  both directions \u{2014} a nine-byte file read as ten makes the size field absorb the
+  flag byte and overrun the tag, and a ten-byte file read as nine starts the next frame on
+  the second flag byte, which is never alphanumeric.
+
+  Writing still emits the ten-byte shape, because writing a file no major tool can read is
+  not a defence of the specification.
+
+### Added
+
+- **`Chapter::with_title`, `set_title`, `title`, `subframe` and `remove_subframe`** \u{2014}
+  reading a chapter title was public but writing one was not. The sub-frame list is a pair
+  of an id and a raw body, so a caller emitting chapters had to hand-encode a text frame
+  to get a title into a file, which left the encoding choice and the trailing NUL to
+  whoever held the bytes. That is how the two ends of this crate drifted apart.
+  `resolve` now uses the same accessor, so a title is read identically either way.
+- **`Chapter::remove_subframe`**, and `set_title` replaces rather than accumulates: two
+  `TIT2` sub-frames read back as whichever a reader finds first, so an accumulating setter
+  makes a title depend on the reader.
+
+### Established about the format, by running the tools rather than reading about them
+
+- **ID3v2.3 does not define UTF-8.** Encoding byte 3 arrived in v2.4. A v2.3 frame tagged
+  UTF-8 is invalid and both mutagen and ffprobe discard the whole frame on sight \u{2014} a
+  tag that looks perfectly well-formed and reads as no metadata at all. v2.3 text must be
+  Latin-1 or UTF-16 with a BOM.
+- **v2.3 `CHAP` and `CTOC` are interoperable**, provided the text encoding is valid: once
+  a correctly framed v2.3 file is written, mutagen, ffprobe and this crate all read the
+  same chapters and titles from it.
+- **mutagen's own v2.3 chapter output is malformed** \u{2014} it writes a spurious leading
+  byte in the element id and an off-by-one frame size, and compensates when reading its
+  own output back.
 ## [0.1.0] - 2026-10-05
 
 First release. `id3-core` is the estate's L0 audio-metadata layer: the tag
