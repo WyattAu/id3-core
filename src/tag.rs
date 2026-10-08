@@ -318,6 +318,17 @@ impl Tag {
 
     /// Append one frame's wire form to `out`.
     fn encode_frame(&self, frame: &Frame, out: &mut Vec<u8>) -> Result<(), Id3Error> {
+        // The chapters addendum is written against ID3v2.3 and v2.4; `CHAP` and `CTOC` do
+        // not exist in v2.2, which uses three-character ids and six-byte headers. Writing
+        // the frame anyway truncates the id to `CHA`, which no reader recognises as
+        // chapters \u{2014} so a caller that fixed the chapters on a v2.2 file would be told
+        // the write succeeded while the file came back chapterless. Refusing is the honest
+        // answer, and the caller can convert the tag to v2.3 or v2.4 instead.
+        if self.major_version == 2 {
+            if let Frame::Chapter(_) | Frame::Toc(_) = frame {
+                return Err(Id3Error::ChaptersUnsupportedAtVersion { major: 2 });
+            }
+        }
         let (id, body) = match frame {
             Frame::Text { id, text } => (*id, text.to_body()?),
             Frame::Picture(p) => (id3(b"APIC"), p.to_body()?),
@@ -813,6 +824,33 @@ mod tests {
             Some("abc"),
             "nine-byte frame headers are what the specification says"
         );
+    }
+
+    #[test]
+    fn a_v22_tag_refuses_chapters_instead_of_losing_them() {
+        // `CHAP` and `CTOC` do not exist in ID3v2.2, which uses three-character frame ids
+        // and six-byte headers. Writing the frames anyway truncates the id to `CHA`, which
+        // no reader recognises as chapters \u{2014} so a caller that fixed a v2.2 file's
+        // chapters would be told the write succeeded while the file came back chapterless.
+        // It reparses fine, which is what makes this silent rather than obvious.
+        let mut tag = Tag::with_version(2).expect("valid");
+        tag.push(Frame::Chapter(crate::chapter::Chapter::new("ch0", 0)));
+        // Matched rather than matched on the message: the variant is the contract, and a
+        // `no_std` test module does not have `ToString` in scope.
+        assert!(matches!(
+            tag.to_bytes(),
+            Err(Id3Error::ChaptersUnsupportedAtVersion { major: 2 })
+        ));
+    }
+
+    #[test]
+    fn a_v22_tag_still_carries_its_text_after_a_chapter_write_is_refused() {
+        // Refusing is only honest if it refuses *everything*: a partial write would leave
+        // the tag modified in ways the caller did not ask for.
+        let mut tag = Tag::with_version(2).expect("valid");
+        tag.set_text(crate::TextField::Title, TextEncoding::Latin1, "Ancient");
+        tag.push(Frame::Chapter(crate::chapter::Chapter::new("ch0", 0)));
+        assert!(tag.to_bytes().is_err());
     }
 
     #[test]

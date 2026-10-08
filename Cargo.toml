@@ -1,6 +1,6 @@
 [package]
 name = "id3-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 description = "ID3v1/ID3v2 audio tag reader and writer — v2.2/2.3/2.4 frames, CHAP/CTOC chapters, APIC art, unsynchronisation, no_std"

@@ -3,6 +3,32 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+### Fixed
+
+- **Writing chapters into an ID3v2.2 tag silently lost them.** `CHAP` and `CTOC` do not
+  exist in v2.2, which uses three-character frame ids and six-byte headers; the writer
+  emitted the frames anyway with the id truncated to `CHA`, which no reader recognises as
+  chapters. The write reported success and the file came back chapterless \u{2014} and it
+  reparsed fine, which is what made the loss silent rather than obvious.
+
+  ID3v2.2 now refuses with `ChaptersUnsupportedAtVersion`, whose message says to convert
+  the tag to v2.3 or v2.4 first. Refusing everything also matters: a partial write would
+  leave the tag modified in ways the caller did not ask for.
+
+  Found by writing the same chapters at all three tag versions and reparsing, which is the
+  kind of sweep that only happens once the question is "what does the estate trust itself
+  for".
+
+### Established about the format, by running the readers
+
+- **UTF-8 chapter titles in an ID3v2.3 tag are read correctly by mutagen and ffprobe**,
+  despite UTF-8 not being defined for v2.3 \u{2014} the earlier release note here said v2.3
+  text must be Latin-1 or UTF-16, which is true for top-level frames and empirically too
+  strong for frames nested inside `CHAP`, where both readers skip the version check the
+  top-level path performs. The writer still emits UTF-8 there, and that is now a documented
+  finding rather than an unnoticed assumption; a stricter reader may still reject it, which
+  is the residual risk and the reason it is written down.
+
 ## [0.2.0] - 2026-10-06
 
 MP3 is the dominant audiobook format, and `CHAP`/`CTOC` had never been checked against a

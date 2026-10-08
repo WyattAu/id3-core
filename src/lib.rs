@@ -96,4 +96,4 @@ pub use frame::{Frame, FrameId, TextField};
 pub use picture::{AttachedPicture, PictureType};
 pub use tag::{find_id3v2, Tag, ID3_IDENTIFIER, MAX_TAG_SIZE};
 pub use text::{Text, TextEncoding};
-pub use v1::TagV1;
+pub use v1::{TagV1, ID3V1_LEN, ID3V1_MAGIC};

@@ -18,6 +18,17 @@ pub enum Id3Error {
     /// Not a fatal condition for a scanner: it just means "no ID3v2 tag here",
     /// which is how [`crate::find_id3v2`] reports absence.
     NotAnId3Tag,
+    /// Chapter frames were requested in a tag version that cannot carry them.
+    ///
+    /// The chapters addendum (`CHAP`/`CTOC`) is written against ID3v2.3 and v2.4. ID3v2.2
+    /// predates it and uses three-character frame ids, so a `CHAP` frame written there
+    /// comes out as `CHA` — a frame no reader recognises as chapters, which is how a
+    /// caller that fixed a v2.2 file's chapters would silently lose them while being told
+    /// the write succeeded.
+    ChaptersUnsupportedAtVersion {
+        /// The major version that cannot carry chapters.
+        major: u8,
+    },
     /// A major version this crate does not implement (only 2 is).
     UnsupportedMajorVersion {
         /// The major version byte found.
@@ -99,6 +110,11 @@ impl fmt::Display for Id3Error {
             Id3Error::UnsupportedMajorVersion { major } => {
                 write!(f, "ID3v{major} is not supported (only v2)")
             }
+            Id3Error::ChaptersUnsupportedAtVersion { major } => write!(
+                f,
+                "ID3v2.{major} cannot carry chapter frames; convert the tag to v2.3 or \
+                 v2.4 first"
+            ),
             Id3Error::UnsupportedRevision { revision } => {
                 write!(f, "ID3v2 revision {revision} is not supported")
             }
