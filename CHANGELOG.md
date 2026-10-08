@@ -29,6 +29,18 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   finding rather than an unnoticed assumption; a stricter reader may still reject it, which
   is the residual risk and the reason it is written down.
 
+### Verified
+
+- **A nested CTOC tree round-trips through mutagen with its hierarchy intact.** A root TOC
+  naming a child TOC and a chapter, plus the child TOC naming two chapters, reads back from
+  mutagen with the same membership, the same child order, and the top-level and ordered
+  flags on the right frames \u{2014} which is the check that would have caught 0.2.0's
+  transposed flags from a real file rather than from a hand-written fixture.
+
+  Also verified there: a chapter with no end serializes `0xFFFFFFFF`, the spec's
+  ignore-sentinel, and mutagen reports it as `end=4294967295` rather than as an error \u{2014}
+  so the sentinel is the interoperable way to say "open-ended", and not something to avoid.
+
 ## [0.2.0] - 2026-10-06
 
 MP3 is the dominant audiobook format, and `CHAP`/`CTOC` had never been checked against a
