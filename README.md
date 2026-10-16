@@ -53,6 +53,26 @@ id3-core = "0.1"
 - **No Vorbis comments.** Ogg-container keys are a different specification with
   different escaping rules.
 
+## Where the wild disagrees with the specification
+
+Two places, both settled by running the tools rather than by reading the specification,
+and both of which changed this crate's behaviour:
+
+- **ID3v2.3's frame header is nine bytes in the specification and ten in practice.**
+  mutagen emits ten and ffmpeg reads ten (`case 3: case 4: taghdrlen = 10;`). A conformant
+  nine-byte tag is a file no major tool can read, so this crate tries ten first and falls
+  back to nine when the frame ids do not come out as four alphanumerics. It *writes* ten,
+  because writing an unreadable file defends nothing. Before this, every ID3v2.3 tag
+  failed to parse entirely, taking the title, artist and chapters with it.
+- **`CTOC`'s top-level flag is bit 1 and ordered is bit 0.** mutagen's
+  `CTOCFlags.TOP_LEVEL = 0x2` and TagLib's `d->isTopLevel = data & 2` agree. The
+  specification's `%000000ab` diagram reads as "six zero bits, then a, then b", which is
+  a at bit 1 counting from the low end. Reading it as a = bit 7 is what transposed them.
+
+Also worth knowing: **ID3v2.3 has no UTF-8.** Encoding byte 3 arrived in v2.4, and a v2.3
+frame tagged UTF-8 is discarded whole by mutagen and ffprobe, leaving a well-formed tag
+that reads as no metadata at all.
+
 ## Example
 
 Read a tag:
