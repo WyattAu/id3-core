@@ -6,7 +6,7 @@ rust-version = "1.85"
 description = "ID3v1/ID3v2 audio tag reader and writer — v2.2/2.3/2.4 frames, CHAP/CTOC chapters, APIC art, unsynchronisation, no_std"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/WyattAu/id3-core"
-keywords = ["id3", "audio", "metadata", "tags", "chapters", "no-std"]
+keywords = ["id3", "metadata", "tags", "chapters", "no-std"]
 categories = ["multimedia::audio", "parser-implementations", "no-std"]
 exclude = [".github/", "fuzz/"]
 
