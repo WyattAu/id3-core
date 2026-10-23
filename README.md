@@ -1,9 +1,9 @@
 # id3-core
 
-ID3v1 / ID3v2 audio tag reader and writer for Rust — v2.2/2.3/2.4 frames,
+ID3v1 / ID3v2 audio tag reader and writer for Rust: v2.2/2.3/2.4 frames,
 `CHAP`/`CTOC` chapters, `APIC` cover art, unsynchronisation, `no_std`.
 
-**Layer:** L0 — leaf · **Estate deps:** none · **Runtime deps:** `thiserror`
+**Layer:** L0: leaf · **Estate deps:** none · **Runtime deps:** `thiserror`
 
 Part of the WyattAu estate's audio path: `id3-core` reads the tags, `dsp-core`
 measures the audio, and an audiobook kit composes both. See
@@ -122,7 +122,7 @@ let chapters = tag.resolved_chapters()?;   // playing order, TOC depth attached
   `deny(panic)` lint is on for the whole crate.
 - **No indexing in library code** (`deny(indexing_slicing)`), so every slice
   access is bounds-checked at the source rather than trusted.
-- **No allocation in the frame-id or size paths** — the parse allocates only for
+- **No allocation in the frame-id or size paths**: the parse allocates only for
   the frames it actually returns.
 - **`no_std` + `alloc`**, verified on `thumbv7em-none-eabihf`. The embedded
   path is what makes this usable inside a player without a runtime.
@@ -134,7 +134,7 @@ let chapters = tag.resolved_chapters()?;   // playing order, TOC depth attached
 
 ## Gates
 
-- `cargo test` — 106 unit tests, 2 integration, 2 doc tests
+- `cargo test`: 106 unit tests, 2 integration, 2 doc tests
 - proptest on synch-safe round-trip, tag round-trip, and Latin-1 totality
 - `cargo clippy --all-features --all-targets -- -D warnings`
 - `cargo fmt --check`
